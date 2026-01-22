@@ -175,7 +175,11 @@ def get_restaurant_menu(menu_url: str) -> str:
 
     return json.dumps(menu_content, indent=2, ensure_ascii=False)
 
+import os
 
 if __name__ == "__main__":
-    # This creates a web server on port 8000
-    mcp.run(transport="sse")
+    # Get the PORT from Render, default to 8000 if not found
+    port = int(os.environ.get("PORT", 8000))
+    
+    # Binds to 0.0.0.0 so Render can access it
+    mcp.run(transport="sse", host="0.0.0.0", port=port)
