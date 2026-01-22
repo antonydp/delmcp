@@ -8,71 +8,66 @@ from typing import List, Optional, Dict, Any
 # Initialize the MCP Server
 mcp = FastMCP("Deliveroo Explorer")
 
-# --- SHARED UTILITIES & CONFIG ---
+# --- SHARED UTILITIES ---
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Accept-Language': 'it-IT,it;q=0.9',
-    'Referer': 'https://deliveroo.it/',
-    'Upgrade-Insecure-Requests': '1'
-}
+def _get_headers():
+    """Restituisce gli header esatti dello script funzionante"""
+    return {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        'Accept-Language': 'it-IT,it;q=0.9',
+        'Referer': 'https://deliveroo.it/',
+    }
 
-def _get_next_data(url: str) -> Optional[Dict]:
+def _get_next_data(url: str, session: requests.Session) -> Optional[Dict]:
     """
-    Helper to extract the __NEXT_DATA__ JSON blob from Deliveroo pages.
-    Includes retry logic for 429 errors.
+    Helper to extract the __NEXT_DATA__ JSON blob.
+    Usa la sessione passata per mantenere i cookie.
     """
-    session = requests.Session()
-    max_retries = 3
-    
-    for attempt in range(max_retries):
-        try:
-            response = session.get(url, headers=HEADERS, timeout=15)
+    try:
+        response = session.get(url, headers=_get_headers(), timeout=15)
+        
+        # Se otteniamo 403 o 429, è un blocco temporaneo
+        if response.status_code in [403, 429]:
+            print(f"Blocked or Rate Limited: {response.status_code}")
+            return None
             
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                script_tag = soup.find('script', id='__NEXT_DATA__')
-                if script_tag and script_tag.string:
-                    return json.loads(script_tag.string)
-                return None
-            
-            elif response.status_code == 429:
-                wait_time = (attempt + 1) * 5
-                time.sleep(wait_time)
-                continue
-            else:
-                return None
-                
-        except Exception as e:
-            print(f"Connection error: {e}")
-            time.sleep(2)
-            
-    return None
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        script_tag = soup.find('script', id='__NEXT_DATA__')
+        
+        if script_tag and script_tag.string:
+            return json.loads(script_tag.string)
+        
+        print("Error: __NEXT_DATA__ tag not found.")
+        return None
+        
+    except Exception as e:
+        print(f"Connection error processing {url}: {e}")
+        return None
 
 # --- MCP TOOLS ---
 
 @mcp.tool()
-def search_restaurants(location_url: str, min_rating: float = 0.0) -> str:
+def search_restaurants(location_url: str) -> str:
     """
-    Scrapes a Deliveroo listing page to return a list of available restaurants.
-    
+    Cerca ristoranti in una data URL di zona Deliveroo.
     Args:
-        location_url: The full URL of the Deliveroo category/location page.
-        min_rating: Filter out restaurants below this rating (default 0.0).
-        
-    Returns:
-        A JSON string containing a summary of restaurants (Name, ID, Rating, Link).
+        location_url: L'URL completo della pagina categoria/zona (es. https://deliveroo.it/it/restaurants/...)
     """
     print(f"Scanning: {location_url}")
-    json_data = _get_next_data(location_url)
+    
+    # Usiamo una sessione anche qui per coerenza
+    with requests.Session() as session:
+        json_data = _get_next_data(location_url, session)
     
     if not json_data:
-        return "Error: Could not fetch data from Deliveroo. Check the URL."
+        return "Error: Could not fetch data. The page might be blocked or invalid."
 
     results = []
     
     try:
-        # Navigate the JSON structure (Matches original script logic)
+        # Percorso JSON identico allo script funzionante
         feed = json_data.get('props', {}).get('initialState', {}).get('home', {}).get('feed', {}).get('results', {}).get('data', [])
         
         for section in feed:
@@ -81,19 +76,14 @@ def search_restaurants(location_url: str, min_rating: float = 0.0) -> str:
                 if 'partner-card' in block.get('rooTemplateId', ''):
                     data = block.get('data', {})
                     
-                    # Extract Data
                     name = data.get('partner-name.content', 'Unknown')
                     
-                    # Rating parsing
+                    # Rating
                     raw_rating = data.get('partner-rating.content', '0')
                     try:
                         rating_val = float(raw_rating.split(' ')[0])
                     except (ValueError, IndexError):
                         rating_val = 0.0
-                    
-                    # Filter by rating
-                    if rating_val < min_rating:
-                        continue
 
                     dist = data.get('distance-presentational.content', '-')
                     
@@ -112,74 +102,72 @@ def search_restaurants(location_url: str, min_rating: float = 0.0) -> str:
                         })
                         
     except Exception as e:
-        return f"Error parsing data: {str(e)}"
+        return f"Error parsing listing data: {str(e)}"
 
     if not results:
-        return "No restaurants found. The page structure might have changed or the location is empty."
+        return "No restaurants found. Check if the URL is correct or if the area is served."
 
-    # Return a condensed version for the AI to read easily
-    return json.dumps(results, indent=2, ensure_ascii=False)
+    return json.dumps(results[:20], indent=2, ensure_ascii=False) # Limitiamo a 20 per non intasare il contesto
 
 @mcp.tool()
 def get_restaurant_menu(menu_url: str) -> str:
     """
-    Fetches the specific menu items for a single restaurant.
-    
+    Scarica il menu di un ristorante specifico.
     Args:
-        menu_url: The full URL of the specific restaurant (obtained from search_restaurants).
-        
-    Returns:
-        A JSON string listing the menu categories and items with prices.
+        menu_url: L'URL ottenuto dalla ricerca (es. https://deliveroo.it/it/menu/...)
     """
-    # Polite delay to prevent banning since the AI might click this quickly
-    time.sleep(1.5) 
+    # Ritardo per educazione verso il server
+    time.sleep(1.0) 
     
-    json_data = _get_next_data(menu_url)
+    # Creiamo una sessione dedicata come nello script funzionante "scarica_singolo_menu"
+    with requests.Session() as session:
+        json_data = _get_next_data(menu_url, session)
+        
     if not json_data:
-        return "Error: Could not load menu."
-
-    menu_content = []
+        return "Error: Could not load menu page (Connection failed or Blocked)."
 
     try:
+        # --- LOGICA ESTRATTA DALLO SCRIPT FUNZIONANTE ---
         menu_obj = json_data['props']['initialState']['menuPage']['menu']
+        
+        # LA CORREZIONE FONDAMENTALE (metas -> root)
         root_data = menu_obj['metas']['root']
         
         raw_items = root_data.get('items', [])
         raw_categories = root_data.get('categories', [])
         
-        # Create a lookup map for categories
+        # Mappa categorie
         category_map = {cat['id']: cat['name'] for cat in raw_categories}
 
-        # Organize by category for the AI
+        # Organizziamo i dati per l'LLM
         organized_menu = {}
 
         for item in raw_items:
             cat_id = item.get('categoryId')
-            cat_name = category_map.get(cat_id, "Other")
+            cat_name = category_map.get(cat_id, "Altro")
             
             if cat_name not in organized_menu:
                 organized_menu[cat_name] = []
-                
+            
+            # Formattazione prezzo come nello script
+            price_data = item.get('price', {})
+            prezzo = price_data.get('formatted', '?')
+
             organized_menu[cat_name].append({
                 "item": item.get('name'),
                 "description": item.get('description'),
-                "price": item.get('price', {}).get('formatted', '?')
+                "price": prezzo
             })
             
-        menu_content = organized_menu
+        return json.dumps(organized_menu, indent=2, ensure_ascii=False)
 
     except KeyError:
-        return "Error: Menu structure not found (Restaurant might be closed or page changed)."
+        return "Error: Menu structure not found. The restaurant might be closed right now."
     except Exception as e:
-        return f"Error parsing menu: {str(e)}"
-
-    return json.dumps(menu_content, indent=2, ensure_ascii=False)
+        return f"Error parsing menu JSON: {str(e)}"
 
 import os
 
 if __name__ == "__main__":
-    # Get the PORT from Render, default to 8000 if not found
     port = int(os.environ.get("PORT", 8000))
-    
-    # Binds to 0.0.0.0 so Render can access it
     mcp.run(transport="sse", host="0.0.0.0", port=port)
